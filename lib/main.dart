@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +7,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'dongle_control.dart';
 import 'proxy_server.dart';
+import 'proxy_task_handler.dart';
 
 void main() {
   runApp(const ProxyApp());
@@ -38,9 +40,15 @@ class ProxyHomePage extends StatefulWidget {
 }
 
 class _ProxyHomePageState extends State<ProxyHomePage> {
-  late ProxyServer _proxy;
   final DongleControl _dongle = DongleControl();
+
+  /// Mirror of the service isolate's state. The sockets live over there so they
+  /// outlive this activity; the UI only renders what the service reports.
   bool _running = false;
+  bool _shutdownPending = false;
+  bool _autoStart = true;
+  Timer? _autoStartTimer;
+  List<DeviceSnapshot> _devices = const [];
   bool _shuttingDownDongle = false;
   String? _localIp;
   final List<ProxyLogEntry> _logs = [];
@@ -52,9 +60,27 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
   @override
   void initState() {
     super.initState();
-    _initProxy();
     _loadIp();
     _initForegroundTask();
+    _ensureBackgroundPermissions();
+    _restoreAutoStart();
+    FlutterForegroundTask.addTaskDataCallback(_onTaskData);
+    // The service may already be running from a previous session.
+    _syncWithService();
+  }
+
+  /// Samsung's Freecess froze this process mid-session and the proxy stopped
+  /// answering while the app still looked "running". A foreground service alone
+  /// does not prevent that; the app also has to be off the battery optimiser.
+  Future<void> _ensureBackgroundPermissions() async {
+    if (!Platform.isAndroid) return;
+    if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+      await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    }
+    final notif = await FlutterForegroundTask.checkNotificationPermission();
+    if (notif != NotificationPermission.granted) {
+      await FlutterForegroundTask.requestNotificationPermission();
+    }
   }
 
   void _initForegroundTask() {
@@ -70,31 +96,90 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
         showNotification: false,
       ),
       foregroundTaskOptions: ForegroundTaskOptions(
-        eventAction: ForegroundTaskEventAction.nothing(),
-        autoRunOnBoot: false,
-        autoRunOnMyPackageReplaced: false,
+        // Periodic tick so the service pushes a fresh snapshot even when the
+        // UI is not driving it.
+        eventAction: ForegroundTaskEventAction.repeat(2000),
+        // Survive a reboot and an app update: in the car the phone may restart
+        // before the app is ever opened.
+        autoRunOnBoot: true,
+        autoRunOnMyPackageReplaced: true,
         allowWakeLock: true,
         allowWifiLock: true,
       ),
     );
   }
 
-  void _initProxy() {
-    _proxy = ProxyServer(
-      port: int.tryParse(_portController.text) ?? 8080,
-      socksPort: int.tryParse(_socksPortController.text) ?? 1080,
-      dnsPort: int.tryParse(_dnsPortController.text) ?? 5353,
-      onLog: (entry) {
-        if (mounted) {
-          setState(() => _logs.insert(0, entry));
-        }
-      },
-      onStatusChanged: (running) {
-        if (mounted) {
-          setState(() => _running = running);
-        }
-      },
-    );
+  static const String _autoStartKey = 'proxy_auto_start';
+
+  Future<void> _restoreAutoStart() async {
+    final saved = await FlutterForegroundTask.getData(key: _autoStartKey);
+    if (mounted) setState(() => _autoStart = saved is bool ? saved : true);
+    _autoStartTimer?.cancel();
+    _autoStartTimer =
+        Timer.periodic(const Duration(seconds: 5), (_) => _maybeAutoStart());
+    _maybeAutoStart();
+  }
+
+  /// Start the proxy on its own once we are on the dongle's network.
+  ///
+  /// Detected by subnet rather than SSID on purpose: reading the SSID needs
+  /// location permission on modern Android, while our own address on the AP is
+  /// free to look up and just as decisive.
+  Future<void> _maybeAutoStart() async {
+    if (!_autoStart || _running) return;
+    final ip = await ProxyServer.getLocalIp();
+    if (ip == null || !ip.startsWith(_dongleSubnetPrefix)) return;
+    if (await FlutterForegroundTask.isRunningService) return;
+    await _toggle();
+  }
+
+  /// The dongle hands out 10.0.0.0/24 on its own AP.
+  static String get _dongleSubnetPrefix {
+    final parts = DongleControl.defaultHost.split('.');
+    return '${parts[0]}.${parts[1]}.${parts[2]}.';
+  }
+
+  Future<void> _syncWithService() async {
+    if (await FlutterForegroundTask.isRunningService) {
+      FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
+    }
+  }
+
+  /// Everything the UI knows about the proxy arrives through here.
+  void _onTaskData(Object data) {
+    if (data is! Map) return;
+    if (!mounted) return;
+    switch (data['type']) {
+      case 'status':
+        setState(() {
+          _running = data['running'] == true;
+          _shutdownPending = data['shutdownPending'] == true;
+          _devices = [
+            for (final d in (data['devices'] as List? ?? const []))
+              DeviceSnapshot(
+                ip: d['ip'] as String? ?? '?',
+                bytes: (d['bytes'] as num?)?.toInt() ?? 0,
+                requests: (d['requests'] as num?)?.toInt() ?? 0,
+                active: Duration(milliseconds: (d['activeMs'] as num?)?.toInt() ?? 0),
+              ),
+          ]..sort((a, b) => b.bytes.compareTo(a.bytes));
+        });
+      case 'log':
+        setState(() {
+          _logs.insert(
+            0,
+            ProxyLogEntry(
+              timestamp: DateTime.fromMillisecondsSinceEpoch(
+                  (data['timestamp'] as num?)?.toInt() ?? 0),
+              method: data['method'] as String? ?? '',
+              url: data['url'] as String? ?? '',
+              statusCode: (data['statusCode'] as num?)?.toInt(),
+              error: data['error'] as String?,
+            ),
+          );
+          if (_logs.length > 500) _logs.removeLast();
+        });
+    }
   }
 
   Future<void> _loadIp() async {
@@ -104,32 +189,41 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
 
   Future<void> _toggle() async {
     if (_running) {
-      await _proxy.stop();
+      await FlutterForegroundTask.stopService();
       WakelockPlus.disable();
-      FlutterForegroundTask.stopService();
       _bandwidthRefreshTimer?.cancel();
       _bandwidthRefreshTimer = null;
+      if (mounted) setState(() => _running = false);
     } else {
-      await _proxy.stop();
-      _initProxy();
-      await _proxy.start();
-      WakelockPlus.enable();
-      FlutterForegroundTask.startService(
+      // Ports travel through shared prefs; the service isolate reads them on
+      // start, since it cannot see this isolate's memory.
+      await FlutterForegroundTask.saveData(
+          key: proxyHttpPortKey, value: int.tryParse(_portController.text) ?? 8080);
+      await FlutterForegroundTask.saveData(
+          key: proxySocksPortKey, value: int.tryParse(_socksPortController.text) ?? 1080);
+      await FlutterForegroundTask.saveData(
+          key: proxyDnsPortKey, value: int.tryParse(_dnsPortController.text) ?? 5353);
+
+      await FlutterForegroundTask.startService(
         notificationTitle: 'Proxy Running',
-        notificationText: 'HTTP :${_portController.text} | SOCKS :${_socksPortController.text} | DNS :${_dnsPortController.text}',
+        notificationText:
+            'HTTP :${_portController.text} | SOCKS :${_socksPortController.text} | DNS :${_dnsPortController.text}',
+        callback: startProxyServiceCallback,
       );
-      // Periodically refresh UI to update bandwidth display
+      WakelockPlus.enable();
       _bandwidthRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-        if (mounted) setState(() {});
+        FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
       });
     }
   }
 
   @override
   void dispose() {
-    _proxy.stop();
-    WakelockPlus.disable();
+    // Deliberately does not stop the proxy: the sockets belong to the service
+    // isolate and are meant to survive this activity being destroyed.
+    FlutterForegroundTask.removeTaskDataCallback(_onTaskData);
     _bandwidthRefreshTimer?.cancel();
+    _autoStartTimer?.cancel();
     _portController.dispose();
     _socksPortController.dispose();
     _dnsPortController.dispose();
@@ -184,11 +278,11 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
     if (directError == null) {
       // It is going down now; make sure a reboot inside the TTL does not see a
       // stale request and power straight back off.
-      _proxy.cancelDongleShutdown();
+      FlutterForegroundTask.sendDataToTask(proxyShutdownCancel);
       message = 'Dongle is shutting down. Wait for its LED to stop before '
           'cutting power.';
     } else if (_running) {
-      _proxy.requestDongleShutdown();
+      FlutterForegroundTask.sendDataToTask(proxyShutdownRequest);
       message = 'Shutdown queued \u2014 the dongle will power off within about '
           '${ProxyServer.pollHintSeconds}s, at its next check-in.';
     } else {
@@ -241,7 +335,7 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
 
   /// Top 3 clients by data, with how long each was actually active.
   Widget _topDevicesCard(ThemeData theme) {
-    final top = _proxy.topDevices(3);
+    final top = _devices.take(3).toList();
     if (top.isEmpty) return const SizedBox.shrink();
 
     return Card(
@@ -255,8 +349,8 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text('Top devices', style: theme.textTheme.titleSmall),
-                if (_proxy.statsByIp.length > 3)
-                  Text('of ${_proxy.statsByIp.length}',
+                if (_devices.length > 3)
+                  Text('of ${_devices.length}',
                       style: theme.textTheme.bodySmall
                           ?.copyWith(color: theme.hintColor)),
               ],
@@ -324,8 +418,7 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setSheetState) {
-            final entries = _proxy.bandwidthByIp.entries.toList()
-              ..sort((a, b) => b.value.compareTo(a.value));
+            final entries = [for (final d in _devices) MapEntry(d.ip, d.bytes)];
             final total = entries.fold<int>(0, (sum, e) => sum + e.value);
 
             return Padding(
@@ -352,15 +445,14 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
                     )
                   else
                     ...entries.take(20).map((e) {
-                      final st = _proxy.statsByIp[e.key];
+                      final st = _devices.firstWhere((d) => d.ip == e.key,
+                          orElse: () => DeviceSnapshot.empty);
                       return ListTile(
                         dense: true,
                         visualDensity: VisualDensity.compact,
                         leading: const Icon(Icons.devices, size: 18),
                         title: Text(e.key, style: const TextStyle(fontFamily: 'monospace', fontSize: 13)),
-                        subtitle: st == null
-                            ? null
-                            : Text('${_formatDuration(st.active)} active  \u00b7  ${st.requests} req',
+                        subtitle: Text('${_formatDuration(st.active)} active  \u00b7  ${st.requests} req',
                                 style: const TextStyle(fontSize: 11)),
                         trailing: Text(_formatBytes(e.value),
                           style: const TextStyle(fontFamily: 'monospace', fontSize: 13, color: Colors.tealAccent)),
@@ -372,6 +464,323 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
           },
         );
       },
+    );
+  }
+
+  /// The controls card. Identical in both orientations.
+  Widget _statusCard(ThemeData theme, String port) {
+    return Card(
+        margin: const EdgeInsets.all(16),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    _running ? Icons.wifi_tethering : Icons.wifi_tethering_off,
+                    size: 40,
+                    color: _running ? Colors.greenAccent : Colors.grey,
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _running ? 'Proxy Running' : 'Proxy Stopped',
+                          style: theme.textTheme.titleLarge,
+                        ),
+                        if (_localIp != null && _running)
+                          GestureDetector(
+                            onTap: () {
+                              Clipboard.setData(
+                                ClipboardData(text: '$_localIp:$port'),
+                              );
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Copied to clipboard'),
+                                  duration: Duration(seconds: 1),
+                                ),
+                              );
+                            },
+                            child: Text(
+                              '$_localIp:$port',
+                              style: theme.textTheme.headlineMedium?.copyWith(
+                                color: Colors.tealAccent,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                          )
+                        else if (_localIp == null)
+                          Text(
+                            'Could not detect WiFi IP',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: Colors.orange,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _portController,
+                      enabled: !_running,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'HTTP',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _socksPortController,
+                      enabled: !_running,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'SOCKS',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: _dnsPortController,
+                      enabled: !_running,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'DNS',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _toggle,
+                  icon: Icon(_running ? Icons.stop : Icons.play_arrow),
+                  label: Text(_running ? 'Stop' : 'Start'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor:
+                        _running ? Colors.red.shade700 : Colors.green.shade700,
+                    minimumSize: const Size(0, 48),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: (_shuttingDownDongle || _shutdownPending)
+                      ? null
+                      : _shutdownDongle,
+                  icon: (_shuttingDownDongle || _shutdownPending)
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.power_settings_new),
+                  label: Text(_shutdownPending
+                      ? 'Waiting for dongle to check in\u2026'
+                      : _shuttingDownDongle
+                          ? 'Shutting down\u2026'
+                          : 'Shut down dongle'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.orange.shade300,
+                    side: BorderSide(color: Colors.orange.shade900),
+                    minimumSize: const Size(0, 44),
+                  ),
+                ),
+              ),
+              SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: _autoStart,
+                title: const Text('Auto-start on dongle Wi-Fi',
+                    style: TextStyle(fontSize: 13)),
+                subtitle: const Text('Starts by itself once this phone joins '
+                    '10.0.0.x', style: TextStyle(fontSize: 11)),
+                onChanged: (v) async {
+                  setState(() => _autoStart = v);
+                  await FlutterForegroundTask.saveData(
+                      key: _autoStartKey, value: v);
+                  if (v) _maybeAutoStart();
+                },
+              ),
+              if (_running && _localIp != null) ...[
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    'HTTP Proxy: $_localIp:$port\n'
+                    'SOCKS5 (SSH): $_localIp:${_socksPortController.text}\n'
+                    'DNS: $_localIp:${_dnsPortController.text}',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      );
+  }
+
+  /// Request log: header plus the scrolling list. The parent always gives this
+  /// a bounded height so the list keeps its own scroll area instead of pushing
+  /// the controls off screen.
+  Widget _logsPanel(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Logs header
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: [
+              Text(
+                'Request Log',
+                style: theme.textTheme.titleSmall,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '(${_logs.length})',
+                style: theme.textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        // Log list
+        Expanded(
+          child: _logs.isEmpty
+              ? Center(
+                  child: Text(
+                    _running
+                        ? 'Waiting for requests...'
+                        : 'Start the proxy to see requests',
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: Colors.grey,
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: _logs.length,
+                  itemBuilder: (context, index) {
+                    final log = _logs[index];
+                    final time =
+                        '${log.timestamp.hour.toString().padLeft(2, '0')}:'
+                        '${log.timestamp.minute.toString().padLeft(2, '0')}:'
+                        '${log.timestamp.second.toString().padLeft(2, '0')}';
+
+                    Color methodColor;
+                    switch (log.method) {
+                      case 'GET':
+                        methodColor = Colors.greenAccent;
+                      case 'POST':
+                        methodColor = Colors.blueAccent;
+                      case 'CONNECT':
+                        methodColor = Colors.purpleAccent;
+                      case 'WS':
+                        methodColor = Colors.cyanAccent;
+                      case 'SOCKS':
+                        methodColor = Colors.amberAccent;
+                      case 'DNS':
+                        methodColor = Colors.tealAccent;
+                      case 'ERROR':
+                        methodColor = Colors.redAccent;
+                      default:
+                        methodColor = Colors.orangeAccent;
+                    }
+
+                    return ListTile(
+                      dense: true,
+                      visualDensity: VisualDensity.compact,
+                      leading: Container(
+                        width: 70,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: methodColor.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          log.method,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: methodColor,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        log.url,
+                        style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: log.error != null
+                          ? Text(
+                              log.error!,
+                              style: const TextStyle(
+                                color: Colors.redAccent,
+                                fontSize: 10,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            )
+                          : null,
+                      trailing: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(
+                            time,
+                            style: const TextStyle(fontSize: 10, color: Colors.grey),
+                          ),
+                          if (log.statusCode != null)
+                            Text(
+                              '${log.statusCode}',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: log.statusCode! < 400
+                                    ? Colors.greenAccent
+                                    : Colors.redAccent,
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 
@@ -398,294 +807,46 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
             ),
         ],
       ),
-      body: Column(
-        children: [
-          // Status card
-          Card(
-            margin: const EdgeInsets.all(16),
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _running ? Icons.wifi_tethering : Icons.wifi_tethering_off,
-                        size: 40,
-                        color: _running ? Colors.greenAccent : Colors.grey,
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              _running ? 'Proxy Running' : 'Proxy Stopped',
-                              style: theme.textTheme.titleLarge,
-                            ),
-                            if (_localIp != null && _running)
-                              GestureDetector(
-                                onTap: () {
-                                  Clipboard.setData(
-                                    ClipboardData(text: '$_localIp:$port'),
-                                  );
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(
-                                      content: Text('Copied to clipboard'),
-                                      duration: Duration(seconds: 1),
-                                    ),
-                                  );
-                                },
-                                child: Text(
-                                  '$_localIp:$port',
-                                  style: theme.textTheme.headlineMedium?.copyWith(
-                                    color: Colors.tealAccent,
-                                    fontFamily: 'monospace',
-                                  ),
-                                ),
-                              )
-                            else if (_localIp == null)
-                              Text(
-                                'Could not detect WiFi IP',
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: Colors.orange,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _portController,
-                          enabled: !_running,
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            labelText: 'HTTP',
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: _socksPortController,
-                          enabled: !_running,
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            labelText: 'SOCKS',
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: TextField(
-                          controller: _dnsPortController,
-                          enabled: !_running,
-                          keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
-                            labelText: 'DNS',
-                            border: OutlineInputBorder(),
-                            isDense: true,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: _toggle,
-                      icon: Icon(_running ? Icons.stop : Icons.play_arrow),
-                      label: Text(_running ? 'Stop' : 'Start'),
-                      style: FilledButton.styleFrom(
-                        backgroundColor:
-                            _running ? Colors.red.shade700 : Colors.green.shade700,
-                        minimumSize: const Size(0, 48),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: _shuttingDownDongle ? null : _shutdownDongle,
-                      icon: _shuttingDownDongle
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.power_settings_new),
-                      label: Text(_shuttingDownDongle
-                          ? 'Shutting down\u2026'
-                          : 'Shut down dongle'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade300,
-                        side: BorderSide(color: Colors.orange.shade900),
-                        minimumSize: const Size(0, 44),
-                      ),
-                    ),
-                  ),
-                  if (_running && _localIp != null) ...[
-                    const SizedBox(height: 12),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surfaceContainerHighest,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        'HTTP Proxy: $_localIp:$port\n'
-                        'SOCKS5 (SSH): $_localIp:${_socksPortController.text}\n'
-                        'DNS: $_localIp:${_dnsPortController.text}',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-          if (_running) _topDevicesCard(theme),
-          // Logs header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          // In landscape a phone leaves roughly 350dp of height: stacked
+          // vertically the controls card alone fills it and the log is pushed
+          // off screen. Side by side instead, each panel scrolling on its own.
+          final wide = constraints.maxWidth > constraints.maxHeight &&
+              constraints.maxWidth >= 600;
+
+          if (!wide) {
+            return Column(
               children: [
-                Text(
-                  'Request Log',
-                  style: theme.textTheme.titleSmall,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  '(${_logs.length})',
-                  style: theme.textTheme.bodySmall,
-                ),
+                _statusCard(theme, port),
+                if (_running) _topDevicesCard(theme),
+                Expanded(child: _logsPanel(theme)),
               ],
-            ),
-          ),
-          const SizedBox(height: 4),
-          // Log list
-          Expanded(
-            child: _logs.isEmpty
-                ? Center(
-                    child: Text(
-                      _running
-                          ? 'Waiting for requests...'
-                          : 'Start the proxy to see requests',
-                      style: theme.textTheme.bodyLarge?.copyWith(
-                        color: Colors.grey,
-                      ),
-                    ),
-                  )
-                : ListView.builder(
-                    itemCount: _logs.length,
-                    itemBuilder: (context, index) {
-                      final log = _logs[index];
-                      final time =
-                          '${log.timestamp.hour.toString().padLeft(2, '0')}:'
-                          '${log.timestamp.minute.toString().padLeft(2, '0')}:'
-                          '${log.timestamp.second.toString().padLeft(2, '0')}';
+            );
+          }
 
-                      Color methodColor;
-                      switch (log.method) {
-                        case 'GET':
-                          methodColor = Colors.greenAccent;
-                        case 'POST':
-                          methodColor = Colors.blueAccent;
-                        case 'CONNECT':
-                          methodColor = Colors.purpleAccent;
-                        case 'WS':
-                          methodColor = Colors.cyanAccent;
-                        case 'SOCKS':
-                          methodColor = Colors.amberAccent;
-                        case 'DNS':
-                          methodColor = Colors.tealAccent;
-                        case 'ERROR':
-                          methodColor = Colors.redAccent;
-                        default:
-                          methodColor = Colors.orangeAccent;
-                      }
-
-                      return ListTile(
-                        dense: true,
-                        visualDensity: VisualDensity.compact,
-                        leading: Container(
-                          width: 70,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: methodColor.withValues(alpha: 0.2),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            log.method,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              color: methodColor,
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                              fontFamily: 'monospace',
-                            ),
-                          ),
-                        ),
-                        title: Text(
-                          log.url,
-                          style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: log.error != null
-                            ? Text(
-                                log.error!,
-                                style: const TextStyle(
-                                  color: Colors.redAccent,
-                                  fontSize: 10,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              )
-                            : null,
-                        trailing: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              time,
-                              style: const TextStyle(fontSize: 10, color: Colors.grey),
-                            ),
-                            if (log.statusCode != null)
-                              Text(
-                                '${log.statusCode}',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.bold,
-                                  color: log.statusCode! < 400
-                                      ? Colors.greenAccent
-                                      : Colors.redAccent,
-                                ),
-                              ),
-                          ],
-                        ),
-                      );
-                    },
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SizedBox(
+                width: constraints.maxWidth * 0.42,
+                // Scrollable so a short landscape viewport never clips the
+                // Start / Shut down buttons.
+                child: SingleChildScrollView(
+                  child: Column(
+                    children: [
+                      _statusCard(theme, port),
+                      if (_running) _topDevicesCard(theme),
+                      const SizedBox(height: 8),
+                    ],
                   ),
-          ),
-        ],
+                ),
+              ),
+              const VerticalDivider(width: 1),
+              Expanded(child: _logsPanel(theme)),
+            ],
+          );
+        },
       ),
     );
   }

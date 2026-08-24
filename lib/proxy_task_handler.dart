@@ -8,6 +8,8 @@ const proxyHttpPortKey = 'proxy_http_port';
 const proxySocksPortKey = 'proxy_socks_port';
 const proxyDnsPortKey = 'proxy_dns_port';
 const proxyStatusRequest = 'proxy_status_request';
+const proxyShutdownRequest = 'proxy_shutdown_request';
+const proxyShutdownCancel = 'proxy_shutdown_cancel';
 
 /// Entry point used by the foreground-service isolate.
 @pragma('vm:entry-point')
@@ -59,8 +61,17 @@ class ProxyTaskHandler extends TaskHandler {
 
   @override
   void onReceiveData(Object data) {
-    if (data == proxyStatusRequest) {
-      _sendSnapshot(running: _proxy?.isRunning ?? false);
+    switch (data) {
+      case proxyStatusRequest:
+        _sendSnapshot(running: _proxy?.isRunning ?? false);
+      case proxyShutdownRequest:
+        // The dongle polls this isolate, not the UI one, so the pending flag
+        // has to be set here.
+        _proxy?.requestDongleShutdown();
+        _sendSnapshot(running: _proxy?.isRunning ?? false);
+      case proxyShutdownCancel:
+        _proxy?.cancelDongleShutdown();
+        _sendSnapshot(running: _proxy?.isRunning ?? false);
     }
   }
 
@@ -88,12 +99,39 @@ class ProxyTaskHandler extends TaskHandler {
   }
 
   void _sendSnapshot({required bool running}) {
+    final stats = _proxy?.statsByIp.values.toList() ?? const <DeviceStats>[];
     FlutterForegroundTask.sendDataToMain({
       'type': 'status',
       'running': running,
-      'bandwidth': Map<String, int>.from(
-        _proxy?.bandwidthByIp ?? const <String, int>{},
-      ),
+      'shutdownPending': _proxy?.shutdownPending ?? false,
+      // Flattened for the isolate boundary: only primitives survive it.
+      'devices': [
+        for (final d in stats)
+          {
+            'ip': d.ip,
+            'bytes': d.bytes,
+            'requests': d.requests,
+            'activeMs': d.active.inMilliseconds,
+          }
+      ],
     });
   }
+}
+
+/// Per-device usage as it crosses the isolate boundary into the UI.
+class DeviceSnapshot {
+  const DeviceSnapshot({
+    required this.ip,
+    required this.bytes,
+    required this.requests,
+    required this.active,
+  });
+
+  static const DeviceSnapshot empty =
+      DeviceSnapshot(ip: '?', bytes: 0, requests: 0, active: Duration.zero);
+
+  final String ip;
+  final int bytes;
+  final int requests;
+  final Duration active;
 }

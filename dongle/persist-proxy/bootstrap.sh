@@ -19,6 +19,12 @@ LOG=/persist/proxy/bootstrap.log
 LISTEN_IP="${AAWG_EXTRA_PROXY_LISTEN_IP:-10.0.0.1}"
 LISTEN_PORT="${AAWG_EXTRA_PROXY_PORT:-8080}"
 UPSTREAM_IP="${AAWG_EXTRA_UPSTREAM_IP:-10.0.0.2}"
+# A previously discovered address beats the static one: the phone's lease can
+# change, and re-learning it costs a boot-time sweep we can skip.
+if [ -r /persist/proxy/.upstream ]; then
+	_disc="$(cat /persist/proxy/.upstream 2>/dev/null)"
+	[ -n "$_disc" ] && UPSTREAM_IP="$_disc"
+fi
 UPSTREAM_PORT="${AAWG_EXTRA_UPSTREAM_PORT:-8080}"
 PAC_PORT="${AAWG_EXTRA_PAC_PORT:-80}"
 PHONE_MAC="${AAWG_EXTRA_PHONE_MAC:-}"

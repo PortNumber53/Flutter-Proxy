@@ -18,7 +18,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SSH_OPTS=(
 	-o HostKeyAlgorithms=+ssh-rsa
 	-o PubkeyAcceptedAlgorithms=+ssh-rsa
-	-o StrictHostKeyChecking=accept-new
+	# The dongle regenerates its dropbear host key on every boot (read-only
+	# rootfs, nowhere to persist one), so pinning it only produces a spurious
+	# MITM failure after each reboot. The link is a WPA2 AP we control.
+	-o UserKnownHostsFile=/dev/null
+	-o StrictHostKeyChecking=no
+	-o LogLevel=ERROR
 	-o ConnectTimeout=10
 )
 

@@ -188,6 +188,26 @@ Device quirks found the hard way, all worked around in the scripts:
 tinyproxy keeps running either way, so anything pointed at `10.0.0.1:8080`
 manually still works.
 
+## Upstream discovery
+
+The dongle no longer trusts a fixed upstream address. Android re-randomises its
+MAC per SSID, so a `dhcp-host` pin is not something to rely on -- observed live:
+the phone came back as `ae:f5:11:e6:ec:84` at `10.0.0.3` after previously being
+pinned as `36:7c:df:f7:e8:4a` at `10.0.0.2`.
+
+The poller therefore doubles as a linker. When the address it believes in stops
+answering twice in a row, it sweeps `.2`-`.20` probing `/__aawg/poll`, and adopts
+whichever host returns a body containing `"shutdown"` -- so an unrelated device
+listening on 8080 cannot be mistaken for the phone. On a change it writes
+`/persist/proxy/.upstream` and runs `relink.sh`, which re-renders
+`tinyproxy.conf` and `wpad.dat` and `SIGHUP`s tinyproxy. `bootstrap.sh` prefers
+`.upstream` over the static config at boot.
+
+Probing uses a **non-blocking connect with a 400ms deadline**. A blocking
+connect to an address with nobody at it waits on ARP until the socket timeout --
+8s per candidate on a real LAN, which made a sweep take over two minutes. This
+does not reproduce in a container, where loopback refuses instantly.
+
 ## Graceful shutdown
 
 Pulling car power cuts the SD card mid-write. `shutdownd` gives the phone app a way

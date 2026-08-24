@@ -30,6 +30,8 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <sys/reboot.h>
+#include <fcntl.h>
+#include <errno.h>
 
 static const char *token = NULL;
 
@@ -41,9 +43,43 @@ static void do_poweroff(void) {
 	_exit(1);
 }
 
-/* One poll: GET the phone's poll path and look for a true shutdown flag.
- * Returns 1 if the app asked us to power off. */
-static int poll_once(const char *ip, int port) {
+/* One poll: GET the phone's poll path.
+ *   -1 nothing answered here
+ *    0 the app answered, no shutdown wanted
+ *    1 the app asked us to power off
+ * A wrong host answering something that is not our endpoint counts as -1, so a
+ * random device on the AP cannot be mistaken for the phone. */
+/* Connect with an explicit deadline.
+ *
+ * A blocking connect() to an address with nobody at it waits on ARP until the
+ * socket timeout -- 8s per candidate on a real LAN, which made a 19-address
+ * sweep take over two minutes. Loopback refuses instantly, so this only shows
+ * up on the device. Non-blocking + select gives us a short probe timeout. */
+static int connect_timeout(int s, struct sockaddr_in *a, int ms) {
+	int flags = fcntl(s, F_GETFL, 0);
+	fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+	int rc = connect(s, (struct sockaddr *)a, sizeof *a);
+	if (rc == 0) { fcntl(s, F_SETFL, flags); return 0; }
+	if (errno != EINPROGRESS) { fcntl(s, F_SETFL, flags); return -1; }
+
+	fd_set w;
+	FD_ZERO(&w);
+	FD_SET(s, &w);
+	struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+	if (select(s + 1, NULL, &w, NULL, &tv) <= 0) { fcntl(s, F_SETFL, flags); return -1; }
+
+	int err = 0;
+	socklen_t len = sizeof err;
+	if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+		fcntl(s, F_SETFL, flags);
+		return -1;
+	}
+	fcntl(s, F_SETFL, flags);
+	return 0;
+}
+
+static int poll_once_to(const char *ip, int port, int connect_ms) {
 	int s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0) return 0;
 
@@ -56,16 +92,16 @@ static int poll_once(const char *ip, int port) {
 	a.sin_family = AF_INET;
 	a.sin_port = htons((unsigned short)port);
 	if (inet_pton(AF_INET, ip, &a.sin_addr) != 1 ||
-	    connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+	    connect_timeout(s, &a, connect_ms) < 0) {
 		close(s);
-		return 0;                      /* app not running yet; try again later */
+		return -1;
 	}
 
 	char req[256];
 	int n = snprintf(req, sizeof req,
 		"GET /__aawg/poll HTTP/1.1\r\nHost: %s:%d\r\n"
 		"Connection: close\r\nUser-Agent: aawg-shutdownd\r\n\r\n", ip, port);
-	if (send(s, req, (size_t)n, 0) != n) { close(s); return 0; }
+	if (send(s, req, (size_t)n, 0) != n) { close(s); return -1; }
 
 	char buf[2048];
 	size_t got = 0;
@@ -80,15 +116,82 @@ static int poll_once(const char *ip, int port) {
 
 	/* Only act on a 200; an error page must never power the car link down. */
 	if (strncmp(buf, "HTTP/1.1 200", 12) != 0 && strncmp(buf, "HTTP/1.0 200", 12) != 0)
-		return 0;
+		return -1;
 	const char *body = strstr(buf, "\r\n\r\n");
-	if (!body) return 0;
-	return strstr(body, "\"shutdown\":true") != NULL;
+	if (!body) return -1;
+	/* Must look like our endpoint, not merely any 200 on port 8080. */
+	if (!strstr(body, "\"shutdown\"")) return -1;
+	return strstr(body, "\"shutdown\":true") != NULL ? 1 : 0;
+}
+
+/* Hand the new upstream to the shell helper, which re-renders tinyproxy.conf
+ * and wpad.dat and reloads. Done out of process so a broken helper cannot take
+ * the poller down with it. */
+/* Normal poll of the address we believe in: allow a slow-but-alive phone. */
+static int poll_once(const char *ip, int port) {
+	return poll_once_to(ip, port, 3000);
+}
+
+static void relink(const char *ip) {
+	pid_t p = fork();
+	if (p == 0) {
+		execl("/bin/sh", "sh", "/persist/proxy/relink.sh", ip, (char *)NULL);
+		_exit(127);
+	}
+}
+
+/* Sweep the DHCP range looking for whoever is serving the app right now.
+ * The phone's address is not guaranteed: Android re-randomises its MAC per SSID,
+ * which breaks any dhcp-host pin, and the lease can simply change. */
+static int discover(const char *base, int port, char *out, size_t outlen) {
+	char prefix[16];
+	snprintf(prefix, sizeof prefix, "%s", base);
+	char *dot = strrchr(prefix, '.');
+	if (!dot) return -1;
+	*dot = '\0';
+
+	for (int host = 2; host <= 20; host++) {
+		char cand[24];
+		snprintf(cand, sizeof cand, "%s.%d", prefix, host);
+		/* 400ms is plenty on a hotspot with a handful of clients, and keeps
+		 * a full sweep to a few seconds even when most addresses are empty. */
+		int r = poll_once_to(cand, port, 400);
+		if (r >= 0) {
+			snprintf(out, outlen, "%s", cand);
+			return r;
+		}
+	}
+	return -1;
 }
 
 static void poll_loop(const char *ip, int port, int interval) {
+	char current[24];
+	snprintf(current, sizeof current, "%s", ip);
+	int misses = 0;
+
 	for (;;) {
-		if (poll_once(ip, port)) do_poweroff();
+		int r = poll_once(current, port);
+
+		if (r < 0) {
+			/* Two consecutive misses before re-scanning: the app briefly
+			 * restarting should not trigger a sweep every cycle. */
+			if (++misses >= 2) {
+				char found[24];
+				int d = discover(ip, port, found, sizeof found);
+				if (d >= 0) {
+					if (strcmp(found, current) != 0) {
+						snprintf(current, sizeof current, "%s", found);
+						relink(current);
+					}
+					misses = 0;
+					r = d;
+				}
+			}
+		} else {
+			misses = 0;
+		}
+
+		if (r == 1) do_poweroff();
 		sleep((unsigned)interval);
 	}
 }

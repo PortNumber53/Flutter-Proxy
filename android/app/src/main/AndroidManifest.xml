@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application
@@ -14,6 +16,14 @@
         android:label="proxy"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- flutter_foreground_task does not declare this itself; without it
+             startService() fails with "Unable to start service ... not found",
+             the proxy runs with no foreground service, and the OS is free to
+             freeze the process. Name must not be changed. -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

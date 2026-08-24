@@ -52,7 +52,9 @@ echo "==> pushing to ${USER_}@${HOST}:/persist/proxy"
 # Dropbear on the target speaks older algorithms than current OpenSSH enables.
 payload | ssh -o HostKeyAlgorithms=+ssh-rsa \
 	      -o PubkeyAcceptedAlgorithms=+ssh-rsa \
-	      -o StrictHostKeyChecking=accept-new \
+	      -o UserKnownHostsFile=/dev/null \
+	      -o StrictHostKeyChecking=no \
+	      -o LogLevel=ERROR \
 	      -o ConnectTimeout=10 \
 	      "${USER_}@${HOST}" \
 	  'mkdir -p /persist/proxy \
