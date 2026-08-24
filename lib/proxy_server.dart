@@ -18,6 +18,36 @@ class ProxyLogEntry {
   });
 }
 
+
+/// Per-client usage: how much data, and how long it was actually active.
+class DeviceStats {
+  DeviceStats(this.ip);
+
+  final String ip;
+  int bytes = 0;
+  int requests = 0;
+  DateTime? firstSeen;
+  DateTime? lastSeen;
+
+  /// Accumulated *active* time, not wall-clock since firstSeen. Gaps longer
+  /// than [idleGap] are treated as the device being idle rather than in use,
+  /// so a phone left connected overnight does not report 8 hours of usage.
+  Duration active = Duration.zero;
+
+  static const Duration idleGap = Duration(seconds: 60);
+
+  void touch(DateTime now, int addedBytes) {
+    bytes += addedBytes;
+    firstSeen ??= now;
+    final prev = lastSeen;
+    if (prev != null) {
+      final gap = now.difference(prev);
+      if (gap <= idleGap) active += gap;
+    }
+    lastSeen = now;
+  }
+}
+
 class ProxyServer {
   HttpServer? _server;
   ServerSocket? _socksServer;
@@ -29,11 +59,28 @@ class ProxyServer {
   final void Function(ProxyLogEntry entry) onLog;
   final void Function(bool running) onStatusChanged;
 
-  /// Bandwidth consumed per client IP address (bytes)
-  final Map<String, int> bandwidthByIp = {};
+  /// Usage per client IP address.
+  final Map<String, DeviceStats> statsByIp = {};
+
+  /// Bandwidth consumed per client IP address (bytes).
+  Map<String, int> get bandwidthByIp =>
+      {for (final e in statsByIp.entries) e.key: e.value.bytes};
+
+  /// The busiest clients, most data first.
+  List<DeviceStats> topDevices([int limit = 3]) {
+    final all = statsByIp.values.toList()
+      ..sort((a, b) => b.bytes.compareTo(a.bytes));
+    return all.take(limit).toList();
+  }
 
   void _trackBandwidth(String ip, int bytes) {
-    bandwidthByIp[ip] = (bandwidthByIp[ip] ?? 0) + bytes;
+    (statsByIp[ip] ??= DeviceStats(ip)).touch(DateTime.now(), bytes);
+  }
+
+  void _trackRequest(String ip) {
+    final st = statsByIp[ip] ??= DeviceStats(ip);
+    st.requests++;
+    st.touch(DateTime.now(), 0);
   }
 
   bool get isRunning => _server != null;
@@ -52,33 +99,23 @@ class ProxyServer {
 
     // Start HTTP proxy
     _server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-    _server!.listen(
-      _handleRequest,
-      onError: (e) {
-        onLog(
-          ProxyLogEntry(
-            timestamp: DateTime.now(),
-            method: 'ERROR',
-            url: e.toString(),
-          ),
-        );
-      },
-    );
+    _server!.listen(_handleRequest, onError: (e) {
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'ERROR',
+        url: e.toString(),
+      ));
+    });
 
     // Start SOCKS5 proxy
     _socksServer = await ServerSocket.bind(InternetAddress.anyIPv4, socksPort);
-    _socksServer!.listen(
-      _handleSocksClient,
-      onError: (e) {
-        onLog(
-          ProxyLogEntry(
-            timestamp: DateTime.now(),
-            method: 'ERROR',
-            url: 'SOCKS: $e',
-          ),
-        );
-      },
-    );
+    _socksServer!.listen(_handleSocksClient, onError: (e) {
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'ERROR',
+        url: 'SOCKS: $e',
+      ));
+    });
 
     // Start DNS proxy
     _dnsServer = await RawDatagramSocket.bind(InternetAddress.anyIPv4, dnsPort);
@@ -154,13 +191,11 @@ class ProxyServer {
       final portBytes = await reader.read(2);
       final targetPort = (portBytes[0] << 8) | portBytes[1];
 
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: 'SOCKS',
-          url: '$host:$targetPort',
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'SOCKS',
+        url: '$host:$targetPort',
+      ));
 
       // Connect to target
       final target = await Socket.connect(host, targetPort);
@@ -169,40 +204,28 @@ class ProxyServer {
       final boundAddr = target.address.rawAddress;
       final boundPort = target.port;
       client.add([
-        0x05,
-        0x00,
-        0x00,
-        0x01,
+        0x05, 0x00, 0x00, 0x01,
         ...boundAddr,
-        (boundPort >> 8) & 0xFF,
-        boundPort & 0xFF,
+        (boundPort >> 8) & 0xFF, boundPort & 0xFF,
       ]);
 
       // Switch to bidirectional tunnel — hand remaining buffered data
       // and future data to target
       final socksClientIp = client.remoteAddress.address;
-      reader.forwardTo(
-        target,
+    _trackRequest(socksClientIp);
+      reader.forwardTo(target,
         onDone: client.close,
         onData: (bytes) => _trackBandwidth(socksClientIp, bytes),
       );
-      target.listen(
-        (data) {
-          _trackBandwidth(socksClientIp, data.length);
-          client.add(data);
-        },
-        onDone: client.close,
-        onError: (_) => client.close(),
-      );
+      target.listen((data) { _trackBandwidth(socksClientIp, data.length); client.add(data); },
+        onDone: client.close, onError: (_) => client.close());
     } catch (e) {
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: 'SOCKS',
-          url: 'connection',
-          error: e.toString(),
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'SOCKS',
+        url: 'connection',
+        error: e.toString(),
+      ));
       try {
         client.close();
       } catch (_) {}
@@ -215,13 +238,11 @@ class ProxyServer {
     final clientIp = datagram.address.address;
     _trackBandwidth(clientIp, datagram.data.length);
 
-    onLog(
-      ProxyLogEntry(
-        timestamp: DateTime.now(),
-        method: 'DNS',
-        url: '$clientIp:${datagram.port}',
-      ),
-    );
+    onLog(ProxyLogEntry(
+      timestamp: DateTime.now(),
+      method: 'DNS',
+      url: '$clientIp:${datagram.port}',
+    ));
 
     try {
       final upstream = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
@@ -240,14 +261,12 @@ class ProxyServer {
       }
       upstream.close();
     } catch (e) {
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: 'DNS',
-          url: '${datagram.address.address}:${datagram.port}',
-          error: e.toString(),
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'DNS',
+        url: '${datagram.address.address}:${datagram.port}',
+        error: e.toString(),
+      ));
     }
   }
 
@@ -263,55 +282,36 @@ class ProxyServer {
   Future<void> _handleConnect(HttpRequest request) async {
     final target = request.uri.host.isNotEmpty
         ? request.uri
-        : Uri.parse(
-            'https://${request.requestedUri.host}:${request.requestedUri.port}',
-          );
+        : Uri.parse('https://${request.requestedUri.host}:${request.requestedUri.port}');
 
-    final host = target.host.isNotEmpty
-        ? target.host
-        : request.headers.value('host')?.split(':').first ?? '';
+    final host = target.host.isNotEmpty ? target.host : request.headers.value('host')?.split(':').first ?? '';
     final port = target.port != 0 ? target.port : 443;
 
-    onLog(
-      ProxyLogEntry(
-        timestamp: DateTime.now(),
-        method: 'CONNECT',
-        url: '$host:$port',
-      ),
-    );
+    onLog(ProxyLogEntry(
+      timestamp: DateTime.now(),
+      method: 'CONNECT',
+      url: '$host:$port',
+    ));
 
     final clientIp = request.connectionInfo?.remoteAddress.address ?? 'unknown';
+    _trackRequest(clientIp);
     try {
       final socket = await Socket.connect(host, port);
       request.response.statusCode = HttpStatus.ok;
       request.response.reasonPhrase = 'Connection Established';
       request.response.headers.contentLength = -1;
       final clientSocket = await request.response.detachSocket();
-      socket.listen(
-        (data) {
-          _trackBandwidth(clientIp, data.length);
-          clientSocket.add(data);
-        },
-        onDone: clientSocket.close,
-        onError: (_) => clientSocket.close(),
-      );
-      clientSocket.listen(
-        (data) {
-          _trackBandwidth(clientIp, data.length);
-          socket.add(data);
-        },
-        onDone: socket.close,
-        onError: (_) => socket.close(),
-      );
+      socket.listen((data) { _trackBandwidth(clientIp, data.length); clientSocket.add(data); },
+        onDone: clientSocket.close, onError: (_) => clientSocket.close());
+      clientSocket.listen((data) { _trackBandwidth(clientIp, data.length); socket.add(data); },
+        onDone: socket.close, onError: (_) => socket.close());
     } catch (e) {
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: 'CONNECT',
-          url: '$host:$port',
-          error: e.toString(),
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'CONNECT',
+        url: '$host:$port',
+        error: e.toString(),
+      ));
       request.response.statusCode = HttpStatus.badGateway;
       await request.response.close();
     }
@@ -323,14 +323,13 @@ class ProxyServer {
     final host = uri.host;
     final port = uri.port != 0 ? uri.port : 80;
     final clientIp = request.connectionInfo?.remoteAddress.address ?? 'unknown';
+    _trackRequest(clientIp);
 
-    onLog(
-      ProxyLogEntry(
-        timestamp: DateTime.now(),
-        method: 'WS',
-        url: uri.toString(),
-      ),
-    );
+    onLog(ProxyLogEntry(
+      timestamp: DateTime.now(),
+      method: 'WS',
+      url: uri.toString(),
+    ));
 
     try {
       final socket = await Socket.connect(host, port);
@@ -348,34 +347,18 @@ class ProxyServer {
       socket.add(buffer.toString().codeUnits);
 
       // Detach the client socket and tunnel bidirectionally
-      final clientSocket = await request.response.detachSocket(
-        writeHeaders: false,
-      );
-      socket.listen(
-        (data) {
-          _trackBandwidth(clientIp, data.length);
-          clientSocket.add(data);
-        },
-        onDone: clientSocket.close,
-        onError: (_) => clientSocket.close(),
-      );
-      clientSocket.listen(
-        (data) {
-          _trackBandwidth(clientIp, data.length);
-          socket.add(data);
-        },
-        onDone: socket.close,
-        onError: (_) => socket.close(),
-      );
+      final clientSocket = await request.response.detachSocket(writeHeaders: false);
+      socket.listen((data) { _trackBandwidth(clientIp, data.length); clientSocket.add(data); },
+        onDone: clientSocket.close, onError: (_) => clientSocket.close());
+      clientSocket.listen((data) { _trackBandwidth(clientIp, data.length); socket.add(data); },
+        onDone: socket.close, onError: (_) => socket.close());
     } catch (e) {
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: 'WS',
-          url: uri.toString(),
-          error: e.toString(),
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'WS',
+        url: uri.toString(),
+        error: e.toString(),
+      ));
       try {
         request.response.statusCode = HttpStatus.badGateway;
         await request.response.close();
@@ -394,14 +377,13 @@ class ProxyServer {
     final uri = request.requestedUri;
     final method = request.method;
     final clientIp = request.connectionInfo?.remoteAddress.address ?? 'unknown';
+    _trackRequest(clientIp);
 
-    onLog(
-      ProxyLogEntry(
-        timestamp: DateTime.now(),
-        method: method,
-        url: uri.toString(),
-      ),
-    );
+    onLog(ProxyLogEntry(
+      timestamp: DateTime.now(),
+      method: method,
+      url: uri.toString(),
+    ));
 
     try {
       final client = HttpClient();
@@ -449,25 +431,21 @@ class ProxyServer {
       }
       await request.response.close();
 
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: method,
-          url: uri.toString(),
-          statusCode: proxyResponse.statusCode,
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: method,
+        url: uri.toString(),
+        statusCode: proxyResponse.statusCode,
+      ));
 
       client.close();
     } catch (e) {
-      onLog(
-        ProxyLogEntry(
-          timestamp: DateTime.now(),
-          method: method,
-          url: uri.toString(),
-          error: e.toString(),
-        ),
-      );
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: method,
+        url: uri.toString(),
+        error: e.toString(),
+      ));
       try {
         request.response.statusCode = HttpStatus.badGateway;
         await request.response.close();
@@ -549,11 +527,7 @@ class _SocketReader {
   /// Stop reading for handshake and forward all future data (plus any
   /// buffered remainder) to [target]. Calls [onDone] when client disconnects.
   /// Optional [onData] callback receives byte count for each chunk forwarded.
-  void forwardTo(
-    Socket target, {
-    required void Function() onDone,
-    void Function(int bytes)? onData,
-  }) {
+  void forwardTo(Socket target, {required void Function() onDone, void Function(int bytes)? onData}) {
     // Send any buffered data that arrived after the last handshake read
     if (_buffer.isNotEmpty) {
       onData?.call(_buffer.length);

@@ -1,0 +1,34 @@
+// Proxy auto-config for the WirelessAndroidAutoDongle hotspot.
+// Rendered from wpad.dat.in by bootstrap.sh.
+//
+// Served as http://@LISTEN_IP@/wpad.dat (also /proxy.pac) with MIME type
+// application/x-ns-proxy-autoconfig.
+
+function FindProxyForURL(url, host) {
+    host = host.toLowerCase();
+
+    // The dongle itself, and anything else on the hotspot subnet, is on-link.
+    // Deliberately no dnsResolve() calls anywhere in this file: DNS lookups
+    // inside a PAC block the client's whole request path, and this network's
+    // only resolver is the dongle.
+    if (isPlainHostName(host) ||
+        host === "localhost" ||
+        shExpMatch(host, "*.local") ||
+        shExpMatch(host, "*.lan") ||
+        shExpMatch(host, "10.0.0.*") ||
+        shExpMatch(host, "127.*")) {
+        return "DIRECT";
+    }
+
+    // Everything else goes to the proxy chosen by AAWG_EXTRA_PAC_TARGET.
+    //
+    // Pointing straight at the phone (the default) means the phone's proxy sees
+    // each client's real source IP, so its per-device metrics are meaningful.
+    // Routed via the dongle instead, tinyproxy is the only peer the phone ever
+    // sees and every client collapses into one row.
+    //
+    // No "; DIRECT" fallback on purpose -- this network has no default route,
+    // so falling back direct would just stall until timeout and would silently
+    // mask the proxy being down.
+    return "PROXY @PROXY_IP@:@PROXY_PORT@";
+}
