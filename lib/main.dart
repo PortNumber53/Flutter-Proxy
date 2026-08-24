@@ -122,8 +122,10 @@ class _ProxyHomePageState extends State<ProxyHomePage>
     final saved = await FlutterForegroundTask.getData(key: _autoStartKey);
     if (mounted) setState(() => _autoStart = saved is bool ? saved : true);
     _autoStartTimer?.cancel();
-    _autoStartTimer =
-        Timer.periodic(const Duration(seconds: 5), (_) => _maybeAutoStart());
+    _autoStartTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _loadIp();
+      _maybeAutoStart();
+    });
     _maybeAutoStart();
   }
 
@@ -199,9 +201,15 @@ class _ProxyHomePageState extends State<ProxyHomePage>
   }
 
   Future<void> _loadIp() async {
-    final ip = await ProxyServer.getLocalIp();
+    final ip = await ProxyServer.getLocalIp(preferPrefix: _dongleSubnetPrefix);
     if (mounted) setState(() => _localIp = ip);
   }
+
+  /// True when this phone is actually on the dongle's AP. When it is not, the
+  /// proxy still runs but nothing on the dongle can reach it, which is worth
+  /// saying out loud rather than just showing an unfamiliar address.
+  bool get _onDongleNetwork =>
+      _localIp != null && _localIp!.startsWith(_dongleSubnetPrefix);
 
   Future<void> _toggle() async {
     if (_running) {
@@ -237,7 +245,10 @@ class _ProxyHomePageState extends State<ProxyHomePage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Coming back from the background: the service may have started, stopped or
     // been restarted while this activity was gone.
-    if (state == AppLifecycleState.resumed) _syncWithService();
+    if (state == AppLifecycleState.resumed) {
+      _syncWithService();
+      _loadIp();
+    }
   }
 
   @override
@@ -582,6 +593,37 @@ class _ProxyHomePageState extends State<ProxyHomePage>
                   ),
                 ),
               ),
+              if (!_onDongleNetwork) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.orange.shade900),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.wifi_find,
+                          size: 18, color: Colors.orange.shade300),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          _localIp == null
+                              ? 'No Wi-Fi address. Join the dongle\'s network '
+                                  '(${DongleControl.defaultHost.substring(0, DongleControl.defaultHost.lastIndexOf('.'))}.x).'
+                              : 'Not on the dongle\'s Wi-Fi \u2014 this phone is '
+                                  'at $_localIp. The dongle cannot reach the '
+                                  'proxy here.',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.orange.shade200),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               SwitchListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
@@ -782,7 +824,9 @@ class _ProxyHomePageState extends State<ProxyHomePage>
             Text(
               _running ? (_localIp == null ? 'Running' : '$_localIp:$port') : 'Stopped',
               style: theme.textTheme.bodyMedium?.copyWith(
-                color: _running ? Colors.tealAccent : Colors.grey,
+                color: !_running
+                    ? Colors.grey
+                    : (_onDongleNetwork ? Colors.tealAccent : Colors.orangeAccent),
                 fontFamily: _running && _localIp != null ? 'monospace' : null,
               ),
             ),

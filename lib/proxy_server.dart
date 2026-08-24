@@ -517,12 +517,27 @@ class ProxyServer {
   }
 
   /// Get the device's local WiFi IP address
-  static Future<String?> getLocalIp() async {
+  /// This device's address, preferring one on [preferPrefix] when present.
+  ///
+  /// The proxy listens on anyIPv4, so several addresses are valid; the one worth
+  /// showing is the one clients can actually reach it on. On the dongle's AP
+  /// that is the 10.0.0.x address, so ask for it explicitly rather than taking
+  /// whatever wlan0 happens to hold.
+  static Future<String?> getLocalIp({String? preferPrefix}) async {
     try {
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLinkLocal: false,
       );
+      if (preferPrefix != null) {
+        for (final iface in interfaces) {
+          for (final addr in iface.addresses) {
+            if (!addr.isLoopback && addr.address.startsWith(preferPrefix)) {
+              return addr.address;
+            }
+          }
+        }
+      }
       for (final iface in interfaces) {
         // Prefer WiFi/WLAN interfaces
         if (iface.name.startsWith('en') ||
