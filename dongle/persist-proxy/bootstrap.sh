@@ -28,6 +28,8 @@ PAC_TARGET="${AAWG_EXTRA_PAC_TARGET:-phone}"
 SHUTDOWN_PORT="${AAWG_EXTRA_SHUTDOWN_PORT:-8081}"
 # Empty means no token required. See the note in /boot/aawgd.conf.
 SHUTDOWN_TOKEN="${AAWG_EXTRA_SHUTDOWN_TOKEN:-}"
+# How often the dongle asks the app whether it should power off. 0 disables.
+POLL_INTERVAL="${AAWG_EXTRA_SHUTDOWN_POLL:-15}"
 WAIT_SECS="${AAWG_EXTRA_PROXY_WAIT:-60}"
 
 log() { echo "[proxy-bootstrap $(date '+%H:%M:%S')] $*" >> "$LOG" 2>&1; }
@@ -197,9 +199,16 @@ start_shutdownd() {
 		log "shutdownd binary missing, skipping"
 		return
 	fi
-	"$PROXY_DIR/bin/shutdownd" "$LISTEN_IP" "$SHUTDOWN_PORT" "$SHUTDOWN_TOKEN" >>"$LOG" 2>&1
+	if [ "$POLL_INTERVAL" -gt 0 ] 2>/dev/null; then
+		"$PROXY_DIR/bin/shutdownd" "$LISTEN_IP" "$SHUTDOWN_PORT" "$SHUTDOWN_TOKEN" \
+			"$UPSTREAM_IP" "$UPSTREAM_PORT" "$POLL_INTERVAL" >>"$LOG" 2>&1
+	else
+		"$PROXY_DIR/bin/shutdownd" "$LISTEN_IP" "$SHUTDOWN_PORT" "$SHUTDOWN_TOKEN" >>"$LOG" 2>&1
+	fi
 	sleep 1
 	if pidof shutdownd >/dev/null 2>&1; then
+		[ "$POLL_INTERVAL" -gt 0 ] 2>/dev/null && \
+			log "polling ${UPSTREAM_IP}:${UPSTREAM_PORT}/__aawg/poll every ${POLL_INTERVAL}s"
 		if [ -n "$SHUTDOWN_TOKEN" ]; then
 			log "shutdownd listening on ${LISTEN_IP}:${SHUTDOWN_PORT} (token required)"
 		else

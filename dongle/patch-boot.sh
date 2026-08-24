@@ -79,6 +79,11 @@ AAWG_EXTRA_PROXY_WAIT=60
 ## clients are yours, so unset is a reasonable default -- set it if you carry
 ## passengers you would rather not hand a power switch to.
 AAWG_EXTRA_SHUTDOWN_PORT=8081
+
+## How often (seconds) the dongle asks the app whether it should power off.
+## This is how the phone shuts the dongle down: Android will not let an app
+## reach this AP, so the dongle has to ask rather than be told. 0 disables.
+AAWG_EXTRA_SHUTDOWN_POLL=15
 #AAWG_EXTRA_SHUTDOWN_TOKEN=
 
 if [ "\$AAWG_EXTRA_PROXY_ENABLE" = "1" ] && [ -x /persist/proxy/bootstrap.sh ]; then

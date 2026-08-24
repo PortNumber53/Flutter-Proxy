@@ -56,6 +56,10 @@ class ProxyServer {
   final int socksPort;
   final int dnsPort;
   final String upstreamDns;
+
+  /// The dongle's address on its own AP; only this peer consumes a pending
+  /// shutdown request.
+  final String dongleIp;
   final void Function(ProxyLogEntry entry) onLog;
   final void Function(bool running) onStatusChanged;
 
@@ -90,6 +94,7 @@ class ProxyServer {
     this.socksPort = 1080,
     this.dnsPort = 5353,
     this.upstreamDns = '8.8.8.8',
+    this.dongleIp = '10.0.0.1',
     required this.onLog,
     required this.onStatusChanged,
   });
@@ -270,7 +275,65 @@ class ProxyServer {
     }
   }
 
+  /// Roughly how long a queued shutdown takes to be picked up, for UI copy.
+  /// Matches AAWG_EXTRA_SHUTDOWN_POLL in the dongle's /boot/aawgd.conf.
+  static const int pollHintSeconds = 15;
+
+  /// Path the dongle polls to ask whether it should power itself off.
+  static const String pollPath = '/__aawg/poll';
+
+  /// Set when the user asks for a shutdown; consumed by the dongle's next poll.
+  DateTime? _shutdownRequestedAt;
+
+  /// A pending request goes stale after this. Without an expiry, a request made
+  /// while the dongle was already off would be waiting for it at the next boot
+  /// and power it straight back down.
+  static const Duration shutdownRequestTtl = Duration(seconds: 90);
+
+  bool get shutdownPending {
+    final at = _shutdownRequestedAt;
+    return at != null && DateTime.now().difference(at) < shutdownRequestTtl;
+  }
+
+  /// Ask the dongle to power off at its next poll.
+  void requestDongleShutdown() => _shutdownRequestedAt = DateTime.now();
+
+  void cancelDongleShutdown() => _shutdownRequestedAt = null;
+
+  /// The dongle polls this instead of the app calling the dongle: Android will
+  /// not let an app bind a socket to the dongle's Wi-Fi, so phone -> dongle is
+  /// impossible, while dongle -> phone is the path the proxy already uses.
+  Future<void> _handlePoll(HttpRequest request) async {
+    final peer = request.connectionInfo?.remoteAddress.address ?? '';
+    final pending = shutdownPending;
+
+    // Only the dongle consumes the flag. Any other client on the AP can read
+    // it, but must not clear it out from under the dongle.
+    if (pending && peer == dongleIp) {
+      _shutdownRequestedAt = null;
+      onLog(ProxyLogEntry(
+        timestamp: DateTime.now(),
+        method: 'POLL',
+        url: 'shutdown -> $peer',
+      ));
+    }
+
+    request.response
+      ..statusCode = HttpStatus.ok
+      ..headers.contentType = ContentType.json
+      ..headers.set(HttpHeaders.cacheControlHeader, 'no-store')
+      ..write('{"shutdown":$pending}');
+    await request.response.close();
+  }
+
   Future<void> _handleRequest(HttpRequest request) async {
+    // Origin-form request aimed at us rather than at a proxy target.
+    if (request.method == 'GET' &&
+        request.uri.host.isEmpty &&
+        request.uri.path == pollPath) {
+      await _handlePoll(request);
+      return;
+    }
     if (request.method == 'CONNECT') {
       await _handleConnect(request);
     } else {

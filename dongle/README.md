@@ -151,6 +151,9 @@ Raspberry Pi Zero 2 W, phone SM-S908U / Android 16, second client a Pi 3B.
 | `shutdownd` POST with wrong/short/long token | `403` in all cases |
 | App button end-to-end (token armed) | app POST reached daemon, refused, dongle up |
 | PAC target `phone`, 2 clients | app shows real IPs (`10.0.0.10`, `10.0.0.8`) |
+| Poll loop (container, stubbed poweroff) | 3 polls no-op, then fired on the flag |
+| Listener responsive during polling | `/ping` 200 while poller running |
+| Dongle checking in to the phone | TIME_WAIT from `10.0.0.1` every 15s |
 | No default route leaked to clients | confirmed |
 
 Device quirks found the hard way, all worked around in the scripts:
@@ -207,7 +210,27 @@ prefixes and suffixes of the real token.
 
 The app side is `lib/dongle_control.dart` plus a confirm-dialog button in `lib/main.dart`.
 
-**The button does not work from the phone.** It works from Wi-Fi-only clients
+### How the button reaches the dongle
+
+Two routes, tried in that order:
+
+1. **Direct** `POST /shutdown` — instant, but only from a device whose default
+   network is this Wi-Fi (a laptop or a Wi-Fi-only tablet).
+2. **Queued** — the app sets a pending flag; the dongle asks for it on its next
+   check-in and powers off. This is the path that works from the phone.
+
+The dongle polls `http://<phone>:8080/__aawg/poll` every
+`AAWG_EXTRA_SHUTDOWN_POLL` seconds (default 15) and powers off when the reply is
+`{"shutdown":true}`. Only a 200 counts, so an error page can never take the car
+link down, and only the dongle's own IP clears the flag so another AP client
+cannot consume it. The flag expires after 90s -- without a TTL, a request made
+while the dongle was already off would be waiting for it at the next boot and
+power it straight back down.
+
+The poll endpoint lives on the proxy's HTTP server, so the proxy must be running
+for the queued path to work; the app says so rather than silently doing nothing.
+
+**Why the direct route cannot work from the phone.** It works from Wi-Fi-only clients
 (verified on a Galaxy Tab S8), but on a phone with cellular the request never
 leaves: `ip route get 10.0.0.1` resolves via `rmnet`, and Android's rules key off
 the output interface, so source-address binding does not help either. Binding to
@@ -216,9 +239,8 @@ AP advertises no `NET_CAPABILITY_INTERNET` and its agent specifier is local-only
 so a generic request is never satisfied and `Network.bindSocket` fails `EPERM`.
 Adding `CHANGE_NETWORK_STATE` and dropping the INTERNET requirement did not help.
 
-The fix is to reverse the direction: dongle -> phone works (that is how the proxy
-has run all along), so the dongle should poll the phone for a pending shutdown
-command. Not built yet.
+Hence the poll: dongle -> phone is the direction that works, and it is how the
+proxy has run all along.
 
 ## Files
 

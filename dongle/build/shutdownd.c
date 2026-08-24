@@ -12,7 +12,13 @@
  * head-unit link. A token may be required in addition (see AAWG_EXTRA_SHUTDOWN_
  * TOKEN); supply it as an X-Auth-Token header or ?token= query parameter.
  *
- * usage: shutdownd <bind-ip> <port> [token]
+ * It also polls the phone. Android will not let an app bind a socket to this
+ * AP (no NET_CAPABILITY_INTERNET, so requestNetwork is never satisfied and
+ * bindSocket fails EPERM), which makes phone -> dongle impossible. dongle ->
+ * phone is the direction that already works, so the dongle asks the app whether
+ * it should power off rather than waiting to be told.
+ *
+ * usage: shutdownd <bind-ip> <port> [token] [poll-ip poll-port poll-interval]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +32,66 @@
 #include <sys/reboot.h>
 
 static const char *token = NULL;
+
+static void do_poweroff(void) {
+	sync();
+	execl("/sbin/poweroff", "poweroff", (char *)NULL);
+	execl("/bin/busybox", "busybox", "poweroff", (char *)NULL);
+	reboot(RB_POWER_OFF);
+	_exit(1);
+}
+
+/* One poll: GET the phone's poll path and look for a true shutdown flag.
+ * Returns 1 if the app asked us to power off. */
+static int poll_once(const char *ip, int port) {
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) return 0;
+
+	struct timeval tv = { .tv_sec = 8, .tv_usec = 0 };
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons((unsigned short)port);
+	if (inet_pton(AF_INET, ip, &a.sin_addr) != 1 ||
+	    connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+		close(s);
+		return 0;                      /* app not running yet; try again later */
+	}
+
+	char req[256];
+	int n = snprintf(req, sizeof req,
+		"GET /__aawg/poll HTTP/1.1\r\nHost: %s:%d\r\n"
+		"Connection: close\r\nUser-Agent: aawg-shutdownd\r\n\r\n", ip, port);
+	if (send(s, req, (size_t)n, 0) != n) { close(s); return 0; }
+
+	char buf[2048];
+	size_t got = 0;
+	for (;;) {
+		if (got >= sizeof buf - 1) break;
+		ssize_t r = recv(s, buf + got, sizeof buf - 1 - got, 0);
+		if (r <= 0) break;
+		got += (size_t)r;
+	}
+	close(s);
+	buf[got] = '\0';
+
+	/* Only act on a 200; an error page must never power the car link down. */
+	if (strncmp(buf, "HTTP/1.1 200", 12) != 0 && strncmp(buf, "HTTP/1.0 200", 12) != 0)
+		return 0;
+	const char *body = strstr(buf, "\r\n\r\n");
+	if (!body) return 0;
+	return strstr(body, "\"shutdown\":true") != NULL;
+}
+
+static void poll_loop(const char *ip, int port, int interval) {
+	for (;;) {
+		if (poll_once(ip, port)) do_poweroff();
+		sleep((unsigned)interval);
+	}
+}
 
 static void say(int c, const char *status, const char *body) {
 	char out[512];
@@ -54,11 +120,22 @@ static int token_ok(const char *req) {
 }
 
 int main(int argc, char **argv) {
-	if (argc < 3 || argc > 4) {
-		fprintf(stderr, "usage: %s <bind-ip> <port> [token]\n", argv[0]);
+	if (argc < 3 || (argc > 4 && argc != 7)) {
+		fprintf(stderr,
+			"usage: %s <bind-ip> <port> [token] [poll-ip poll-port poll-interval]\n",
+			argv[0]);
 		return 2;
 	}
-	if (argc == 4 && *argv[3]) token = argv[3];
+	if (argc >= 4 && *argv[3]) token = argv[3];
+
+	const char *poll_ip = NULL;
+	int poll_port = 0, poll_interval = 15;
+	if (argc == 7 && *argv[4]) {
+		poll_ip = argv[4];
+		poll_port = atoi(argv[5]);
+		poll_interval = atoi(argv[6]);
+		if (poll_interval < 5) poll_interval = 5;
+	}
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_IGN);
 
@@ -80,6 +157,17 @@ int main(int argc, char **argv) {
 
 	if (fork() > 0) return 0;
 	setsid();
+
+	/* Poller runs in its own process so a blocked poll cannot stall the
+	 * listener, and vice versa. */
+	if (poll_ip) {
+		pid_t p = fork();
+		if (p == 0) {
+			close(s);
+			poll_loop(poll_ip, poll_port, poll_interval);
+			_exit(0);
+		}
+	}
 
 	for (;;) {
 		struct sockaddr_in peer;
@@ -132,12 +220,7 @@ int main(int argc, char **argv) {
 			 * networking down, then hand off to the normal shutdown path so
 			 * rc scripts run and filesystems unmount cleanly. */
 			sleep(1);
-			sync();
-			execl("/sbin/poweroff", "poweroff", (char *)NULL);
-			execl("/bin/busybox", "busybox", "poweroff", (char *)NULL);
-			/* Last resort if neither exists: ask the kernel directly. */
-			reboot(RB_POWER_OFF);
-			_exit(1);
+			do_poweroff();
 		}
 	}
 }

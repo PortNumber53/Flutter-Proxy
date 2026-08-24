@@ -170,8 +170,34 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
     if (confirmed != true || !mounted) return;
 
     setState(() => _shuttingDownDongle = true);
-    final error = await _dongle.shutdown();
+
+    // Two routes, because neither works everywhere:
+    //  - direct POST: instant, but only from a device whose default network is
+    //    this Wi-Fi. A phone with cellular cannot reach the dongle at all.
+    //  - queued: the dongle polls us every ~15s and powers off when it sees the
+    //    flag. Needs the proxy running, since the poll endpoint lives on it.
+    final directError = await _dongle.shutdown();
     if (!mounted) return;
+
+    String? error;
+    String message;
+    if (directError == null) {
+      // It is going down now; make sure a reboot inside the TTL does not see a
+      // stale request and power straight back off.
+      _proxy.cancelDongleShutdown();
+      message = 'Dongle is shutting down. Wait for its LED to stop before '
+          'cutting power.';
+    } else if (_running) {
+      _proxy.requestDongleShutdown();
+      message = 'Shutdown queued \u2014 the dongle will power off within about '
+          '${ProxyServer.pollHintSeconds}s, at its next check-in.';
+    } else {
+      error = 'Cannot reach the dongle directly from this phone, and the proxy '
+          'is stopped so it cannot check in either. Start the proxy and try '
+          'again, or unplug the dongle.';
+      message = error;
+    }
+
     setState(() => _shuttingDownDongle = false);
 
     // Explicit light-on-dark: the default SnackBar content colour is derived
@@ -187,9 +213,7 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
             const SizedBox(width: 12),
             Expanded(
               child: Text(
-                error ??
-                    'Dongle is shutting down. Wait for its LED to stop before '
-                    'cutting power.',
+                message,
                 style: const TextStyle(color: Colors.white, fontSize: 14),
               ),
             ),
