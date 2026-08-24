@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'dongle_control.dart';
@@ -475,55 +474,6 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
           padding: const EdgeInsets.all(16),
           child: Column(
             children: [
-              Row(
-                children: [
-                  Icon(
-                    _running ? Icons.wifi_tethering : Icons.wifi_tethering_off,
-                    size: 40,
-                    color: _running ? Colors.greenAccent : Colors.grey,
-                  ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _running ? 'Proxy Running' : 'Proxy Stopped',
-                          style: theme.textTheme.titleLarge,
-                        ),
-                        if (_localIp != null && _running)
-                          GestureDetector(
-                            onTap: () {
-                              Clipboard.setData(
-                                ClipboardData(text: '$_localIp:$port'),
-                              );
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text('Copied to clipboard'),
-                                  duration: Duration(seconds: 1),
-                                ),
-                              );
-                            },
-                            child: Text(
-                              '$_localIp:$port',
-                              style: theme.textTheme.headlineMedium?.copyWith(
-                                color: Colors.tealAccent,
-                                fontFamily: 'monospace',
-                              ),
-                            ),
-                          )
-                        else if (_localIp == null)
-                          Text(
-                            'Could not detect WiFi IP',
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: Colors.orange,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
               const SizedBox(height: 12),
               Row(
                 children: [
@@ -791,7 +741,28 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Proxy'),
+        // Status lives here now: the old 40px icon + headline + IP row cost
+        // ~100dp of height, which in landscape forced the left panel to scroll.
+        // The IP is still shown in full by the endpoints box below.
+        title: Row(
+          children: [
+            const Text('Proxy'),
+            const SizedBox(width: 12),
+            Icon(
+              _running ? Icons.wifi_tethering : Icons.wifi_tethering_off,
+              size: 18,
+              color: _running ? Colors.greenAccent : Colors.grey,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              _running ? (_localIp == null ? 'Running' : '$_localIp:$port') : 'Stopped',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: _running ? Colors.tealAccent : Colors.grey,
+                fontFamily: _running && _localIp != null ? 'monospace' : null,
+              ),
+            ),
+          ],
+        ),
         actions: [
           if (_running)
             IconButton(
