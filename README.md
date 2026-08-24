@@ -1,20 +1,17 @@
-# Flutter-Proxy
+# proxy
 
-A flutter app to make your Android phone work as a proxy server for other devices
+A new Flutter project.
 
-On Android, starting the proxy launches a visible foreground service. The proxy
-sockets live in that service's Dart isolate, so traffic continues when the app
-is minimized, removed from Recents, restarted after an unexpected process stop,
-or rebooted while the proxy was active. Tap **Stop** before closing the app when
-you do not want the proxy to restart.
+## Getting Started
 
-Android 13 and later may ask for notification permission when the proxy starts.
-Some manufacturers also require disabling battery optimization for reliable
-long-running services.
+This project is a starting point for a Flutter application.
 
-## iOS limitation
+A few resources to get you started if this is your first Flutter project:
 
-iOS does not permit an ordinary app to host an always-on proxy in the
-background. The configured background task can run only periodically; a true
-continuous iOS proxy requires an Apple Network Extension entitlement and a
-native Network Extension target.
+- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
+- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.
