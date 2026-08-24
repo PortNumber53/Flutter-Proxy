@@ -1,0 +1,329 @@
+/*
+ * shutdownd -- a tiny static HTTP endpoint that powers the dongle down cleanly.
+ *
+ * The dongle is normally unplugged by pulling car power, which yanks the SD card
+ * mid-write. This gives the phone app a way to ask for a real shutdown first.
+ *
+ *   GET  /ping      -> 200 {"status":"ok",...}   (liveness, never destructive)
+ *   POST /shutdown  -> 200, then sync(2) + poweroff
+ *
+ * Shutdown is POST-only on purpose: a GET would let a stray link prefetch, a
+ * browser probing for a captive portal, or a mistyped URL power off the car's
+ * head-unit link. A token may be required in addition (see AAWG_EXTRA_SHUTDOWN_
+ * TOKEN); supply it as an X-Auth-Token header or ?token= query parameter.
+ *
+ * It also polls the phone. Android will not let an app bind a socket to this
+ * AP (no NET_CAPABILITY_INTERNET, so requestNetwork is never satisfied and
+ * bindSocket fails EPERM), which makes phone -> dongle impossible. dongle ->
+ * phone is the direction that already works, so the dongle asks the app whether
+ * it should power off rather than waiting to be told.
+ *
+ * usage: shutdownd <bind-ip> <port> [token] [poll-ip poll-port poll-interval]
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/time.h>
+#include <sys/reboot.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static const char *token = NULL;
+
+static void do_poweroff(void) {
+	sync();
+	execl("/sbin/poweroff", "poweroff", (char *)NULL);
+	execl("/bin/busybox", "busybox", "poweroff", (char *)NULL);
+	reboot(RB_POWER_OFF);
+	_exit(1);
+}
+
+/* One poll: GET the phone's poll path.
+ *   -1 nothing answered here
+ *    0 the app answered, no shutdown wanted
+ *    1 the app asked us to power off
+ * A wrong host answering something that is not our endpoint counts as -1, so a
+ * random device on the AP cannot be mistaken for the phone. */
+/* Connect with an explicit deadline.
+ *
+ * A blocking connect() to an address with nobody at it waits on ARP until the
+ * socket timeout -- 8s per candidate on a real LAN, which made a 19-address
+ * sweep take over two minutes. Loopback refuses instantly, so this only shows
+ * up on the device. Non-blocking + select gives us a short probe timeout. */
+static int connect_timeout(int s, struct sockaddr_in *a, int ms) {
+	int flags = fcntl(s, F_GETFL, 0);
+	fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+	int rc = connect(s, (struct sockaddr *)a, sizeof *a);
+	if (rc == 0) { fcntl(s, F_SETFL, flags); return 0; }
+	if (errno != EINPROGRESS) { fcntl(s, F_SETFL, flags); return -1; }
+
+	fd_set w;
+	FD_ZERO(&w);
+	FD_SET(s, &w);
+	struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+	if (select(s + 1, NULL, &w, NULL, &tv) <= 0) { fcntl(s, F_SETFL, flags); return -1; }
+
+	int err = 0;
+	socklen_t len = sizeof err;
+	if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+		fcntl(s, F_SETFL, flags);
+		return -1;
+	}
+	fcntl(s, F_SETFL, flags);
+	return 0;
+}
+
+static int poll_once_to(const char *ip, int port, int connect_ms) {
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) return 0;
+
+	struct timeval tv = { .tv_sec = 8, .tv_usec = 0 };
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons((unsigned short)port);
+	if (inet_pton(AF_INET, ip, &a.sin_addr) != 1 ||
+	    connect_timeout(s, &a, connect_ms) < 0) {
+		close(s);
+		return -1;
+	}
+
+	char req[256];
+	int n = snprintf(req, sizeof req,
+		"GET /__aawg/poll HTTP/1.1\r\nHost: %s:%d\r\n"
+		"Connection: close\r\nUser-Agent: aawg-shutdownd\r\n\r\n", ip, port);
+	if (send(s, req, (size_t)n, 0) != n) { close(s); return -1; }
+
+	char buf[2048];
+	size_t got = 0;
+	for (;;) {
+		if (got >= sizeof buf - 1) break;
+		ssize_t r = recv(s, buf + got, sizeof buf - 1 - got, 0);
+		if (r <= 0) break;
+		got += (size_t)r;
+	}
+	close(s);
+	buf[got] = '\0';
+
+	/* Only act on a 200; an error page must never power the car link down. */
+	if (strncmp(buf, "HTTP/1.1 200", 12) != 0 && strncmp(buf, "HTTP/1.0 200", 12) != 0)
+		return -1;
+	const char *body = strstr(buf, "\r\n\r\n");
+	if (!body) return -1;
+	/* Must look like our endpoint, not merely any 200 on port 8080. */
+	if (!strstr(body, "\"shutdown\"")) return -1;
+	return strstr(body, "\"shutdown\":true") != NULL ? 1 : 0;
+}
+
+/* Hand the new upstream to the shell helper, which re-renders tinyproxy.conf
+ * and wpad.dat and reloads. Done out of process so a broken helper cannot take
+ * the poller down with it. */
+/* Normal poll of the address we believe in: allow a slow-but-alive phone. */
+static int poll_once(const char *ip, int port) {
+	return poll_once_to(ip, port, 3000);
+}
+
+static void relink(const char *ip) {
+	pid_t p = fork();
+	if (p == 0) {
+		execl("/bin/sh", "sh", "/persist/proxy/relink.sh", ip, (char *)NULL);
+		_exit(127);
+	}
+}
+
+/* Sweep the DHCP range looking for whoever is serving the app right now.
+ * The phone's address is not guaranteed: Android re-randomises its MAC per SSID,
+ * which breaks any dhcp-host pin, and the lease can simply change. */
+static int discover(const char *base, int port, char *out, size_t outlen) {
+	char prefix[16];
+	snprintf(prefix, sizeof prefix, "%s", base);
+	char *dot = strrchr(prefix, '.');
+	if (!dot) return -1;
+	*dot = '\0';
+
+	for (int host = 2; host <= 20; host++) {
+		char cand[24];
+		snprintf(cand, sizeof cand, "%s.%d", prefix, host);
+		/* 400ms is plenty on a hotspot with a handful of clients, and keeps
+		 * a full sweep to a few seconds even when most addresses are empty. */
+		int r = poll_once_to(cand, port, 400);
+		if (r >= 0) {
+			snprintf(out, outlen, "%s", cand);
+			return r;
+		}
+	}
+	return -1;
+}
+
+static void poll_loop(const char *ip, int port, int interval) {
+	char current[24];
+	snprintf(current, sizeof current, "%s", ip);
+	int misses = 0;
+
+	for (;;) {
+		int r = poll_once(current, port);
+
+		if (r < 0) {
+			/* Two consecutive misses before re-scanning: the app briefly
+			 * restarting should not trigger a sweep every cycle. */
+			if (++misses >= 2) {
+				char found[24];
+				int d = discover(ip, port, found, sizeof found);
+				if (d >= 0) {
+					if (strcmp(found, current) != 0) {
+						snprintf(current, sizeof current, "%s", found);
+						relink(current);
+					}
+					misses = 0;
+					r = d;
+				}
+			}
+		} else {
+			misses = 0;
+		}
+
+		if (r == 1) do_poweroff();
+		sleep((unsigned)interval);
+	}
+}
+
+static void say(int c, const char *status, const char *body) {
+	char out[512];
+	int n = snprintf(out, sizeof out,
+		"HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+		"Content-Length: %zu\r\nConnection: close\r\n\r\n%s",
+		status, strlen(body), body);
+	send(c, out, (size_t)n, 0);
+}
+
+/* Constant-time compare so a token cannot be recovered byte-by-byte by timing. */
+static int token_ok(const char *req) {
+	if (!token || !*token) return 1;               /* no token configured */
+	const char *p = strstr(req, "X-Auth-Token:");
+	size_t skip = 13;
+	if (!p) { p = strstr(req, "token="); skip = 6; }
+	if (!p) return 0;
+	p += skip;
+	while (*p == ' ') p++;
+	size_t n = strlen(token);
+	unsigned char diff = 0;
+	for (size_t i = 0; i < n; i++) diff |= (unsigned char)(p[i] ^ token[i]);
+	char end = p[n];
+	if (end != '\0' && end != '\r' && end != '\n' && end != ' ' && end != '&') diff |= 1;
+	return diff == 0;
+}
+
+int main(int argc, char **argv) {
+	if (argc < 3 || (argc > 4 && argc != 7)) {
+		fprintf(stderr,
+			"usage: %s <bind-ip> <port> [token] [poll-ip poll-port poll-interval]\n",
+			argv[0]);
+		return 2;
+	}
+	if (argc >= 4 && *argv[3]) token = argv[3];
+
+	const char *poll_ip = NULL;
+	int poll_port = 0, poll_interval = 15;
+	if (argc == 7 && *argv[4]) {
+		poll_ip = argv[4];
+		poll_port = atoi(argv[5]);
+		poll_interval = atoi(argv[6]);
+		if (poll_interval < 5) poll_interval = 5;
+	}
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGCHLD, SIG_IGN);
+
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) { perror("shutdownd: socket"); return 1; }
+	int one = 1;
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons((unsigned short)atoi(argv[2]));
+	if (inet_pton(AF_INET, argv[1], &a.sin_addr) != 1) {
+		fprintf(stderr, "shutdownd: bad bind address %s\n", argv[1]);
+		return 1;
+	}
+	if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("shutdownd: bind"); return 1; }
+	if (listen(s, 8) < 0) { perror("shutdownd: listen"); return 1; }
+
+	if (fork() > 0) return 0;
+	setsid();
+
+	/* Poller runs in its own process so a blocked poll cannot stall the
+	 * listener, and vice versa. */
+	if (poll_ip) {
+		pid_t p = fork();
+		if (p == 0) {
+			close(s);
+			poll_loop(poll_ip, poll_port, poll_interval);
+			_exit(0);
+		}
+	}
+
+	for (;;) {
+		struct sockaddr_in peer;
+		socklen_t plen = sizeof peer;
+		int c = accept(s, (struct sockaddr *)&peer, &plen);
+		if (c < 0) continue;
+
+		int fired = 0;
+		struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+		setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+		/* Read the whole head before answering; replying early and closing
+		 * sends an RST that the peer sees as a failed write, not a response. */
+		char req[4096];
+		size_t got = 0;
+		for (;;) {
+			if (got >= sizeof req - 1) break;
+			ssize_t n = recv(c, req + got, sizeof req - 1 - got, 0);
+			if (n <= 0) break;
+			got += (size_t)n;
+			req[got] = '\0';
+			if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n")) break;
+		}
+		req[got] = '\0';
+
+		if (got == 0) {
+			/* nothing to do */
+		} else if (strncmp(req, "GET /ping", 9) == 0) {
+			say(c, "200 OK", "{\"status\":\"ok\",\"service\":\"shutdownd\"}");
+		} else if (strncmp(req, "POST /shutdown", 14) == 0) {
+			if (!token_ok(req)) {
+				say(c, "403 Forbidden", "{\"error\":\"bad or missing token\"}");
+			} else {
+				say(c, "200 OK", "{\"status\":\"shutting down\"}");
+				fired = 1;
+			}
+		} else if (strncmp(req, "GET /shutdown", 13) == 0) {
+			say(c, "405 Method Not Allowed", "{\"error\":\"use POST\"}");
+		} else {
+			say(c, "404 Not Found", "{\"error\":\"not found\"}");
+		}
+
+		shutdown(c, SHUT_WR);
+		for (;;) { char sink[256]; if (recv(c, sink, sizeof sink, 0) <= 0) break; }
+		close(c);
+
+		if (fired) {
+			/* Flush the response out of the socket buffer before init tears
+			 * networking down, then hand off to the normal shutdown path so
+			 * rc scripts run and filesystems unmount cleanly. */
+			sleep(1);
+			do_poweroff();
+		}
+	}
+}

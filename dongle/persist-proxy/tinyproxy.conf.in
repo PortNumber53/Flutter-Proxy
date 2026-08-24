@@ -1,0 +1,48 @@
+# Rendered to tinyproxy.conf by bootstrap.sh (@TOKENS@ substituted).
+
+User root
+Group root
+
+Listen @LISTEN_IP@
+Port @LISTEN_PORT@
+
+# Every request that is not exempted by the PAC is handed to the Flutter app
+# running on the phone. tinyproxy re-resolves nothing here -- this is a literal
+# address, so pin the phone's lease (AAWG_EXTRA_PHONE_MAC) or it will drift.
+upstream http @UPSTREAM_IP@:@UPSTREAM_PORT@
+
+# ...except the dongle's own subnet, which must stay local. Without these the
+# phone's proxy would be asked to fetch http://10.0.0.1/wpad.dat over cellular.
+#
+# These must come AFTER the catch-all above: tinyproxy lets the *last* matching
+# rule win, so the exceptions have to be able to override it.
+upstream none "10.0.0.0/8"
+upstream none "127.0.0.0/8"
+upstream none "localhost"
+upstream none "."
+
+# Only the AP's own clients may use the proxy.
+Allow 10.0.0.0/24
+
+# Idle timeout. Deliberately not the 600s default: browsers and background apps
+# park idle CONNECT tunnels, and every parked tunnel holds a client slot. At 600
+# a single tablet filled the pool and tinyproxy started refusing connections.
+Timeout 120
+
+# One thread per connection. A browser opens 6+ parallel tunnels per origin and
+# Android background sync adds more, so 60 is far too tight for even two devices.
+# musl's default thread stack is 128K, so 256 threads is ~32M of address space on
+# a box with ~360M free -- the real per-thread cost here is small.
+MaxClients 256
+
+PidFile "/persist/proxy/run/tinyproxy.pid"
+LogFile "/persist/proxy/tinyproxy.log"
+LogLevel Info
+
+# HTTPS CONNECT tunnelling. Restricted on purpose -- an open CONNECT relay on a
+# car hotspot is a bad idea. Add ports here if something legitimate needs one.
+ConnectPort 443
+ConnectPort 8443
+
+ViaProxyName "aawg"
+DisableViaHeader No
