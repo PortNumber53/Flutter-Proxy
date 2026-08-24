@@ -93,8 +93,20 @@ class DongleControl {
       if (e.code == 'no_wifi') {
         return 'Not connected to Wi-Fi. Join the dongle\'s network first.';
       }
+      // Android refuses to let an app bind a socket to a network it was not
+      // granted, and it will not grant the dongle's AP because that AP has no
+      // internet. Every request to 10.0.0.1 is then routed out the cellular
+      // interface and lost. There is no user-side workaround -- turning mobile
+      // data off does not help, because Android still declines to make the
+      // unvalidated Wi-Fi the default network.
+      final msg = e.message ?? '';
+      if (msg.contains('EPERM') || msg.contains('Binding socket')) {
+        return 'This phone cannot reach the dongle: Android routes app traffic '
+            'over mobile data and will not let the app use the dongle\'s Wi-Fi. '
+            'Shut it down from a Wi-Fi-only device, or unplug it.';
+      }
       return 'Could not reach the dongle at $host:$port. '
-          'Are you on its Wi-Fi? (${e.message})';
+          'Are you on its Wi-Fi? ($msg)';
     } on SocketException catch (e) {
       return 'Could not reach the dongle at $host:$port. '
           '(${e.osError?.message ?? e.message})';

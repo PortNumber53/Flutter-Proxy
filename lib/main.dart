@@ -174,13 +174,37 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
     if (!mounted) return;
     setState(() => _shuttingDownDongle = false);
 
+    // Explicit light-on-dark: the default SnackBar content colour is derived
+    // from the theme, which renders near-black text on the red error surface
+    // and is essentially unreadable.
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(error ??
-            'Dongle is shutting down. Wait for its LED to stop before '
-            'cutting power.'),
-        backgroundColor: error == null ? null : Colors.red.shade900,
-        duration: Duration(seconds: error == null ? 5 : 8),
+        content: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(error == null ? Icons.power_settings_new : Icons.error_outline,
+                color: Colors.white, size: 20),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                error ??
+                    'Dongle is shutting down. Wait for its LED to stop before '
+                    'cutting power.',
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor:
+            error == null ? Colors.green.shade800 : Colors.red.shade800,
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: error == null ? 5 : 10),
+        action: SnackBarAction(
+          label: 'Dismiss',
+          textColor: Colors.white,
+          onPressed: () =>
+              ScaffoldMessenger.of(context).hideCurrentSnackBar(),
+        ),
       ),
     );
   }
