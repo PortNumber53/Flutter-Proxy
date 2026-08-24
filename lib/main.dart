@@ -9,6 +9,12 @@ import 'proxy_server.dart';
 import 'proxy_task_handler.dart';
 
 void main() {
+  // Required before the UI and the service isolate can exchange anything.
+  // Without it sendDataToMain/sendDataToTask silently go nowhere: the proxy runs
+  // but the UI never learns it, so the button stays on "Start" and tapping it
+  // appears to do nothing.
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
   runApp(const ProxyApp());
 }
 
@@ -38,7 +44,8 @@ class ProxyHomePage extends StatefulWidget {
   State<ProxyHomePage> createState() => _ProxyHomePageState();
 }
 
-class _ProxyHomePageState extends State<ProxyHomePage> {
+class _ProxyHomePageState extends State<ProxyHomePage>
+    with WidgetsBindingObserver {
   final DongleControl _dongle = DongleControl();
 
   /// Mirror of the service isolate's state. The sockets live over there so they
@@ -63,6 +70,7 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
     _initForegroundTask();
     _ensureBackgroundPermissions();
     _restoreAutoStart();
+    WidgetsBinding.instance.addObserver(this);
     FlutterForegroundTask.addTaskDataCallback(_onTaskData);
     // The service may already be running from a previous session.
     _syncWithService();
@@ -139,8 +147,17 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
   }
 
   Future<void> _syncWithService() async {
-    if (await FlutterForegroundTask.isRunningService) {
+    // Ask the OS directly rather than trusting a message round-trip: the
+    // service may already be running from autoRunOnBoot before this activity
+    // ever existed.
+    final live = await FlutterForegroundTask.isRunningService;
+    if (mounted && live != _running) setState(() => _running = live);
+    if (live) {
       FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
+      _bandwidthRefreshTimer?.cancel();
+      _bandwidthRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
+      });
     }
   }
 
@@ -217,9 +234,17 @@ class _ProxyHomePageState extends State<ProxyHomePage> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Coming back from the background: the service may have started, stopped or
+    // been restarted while this activity was gone.
+    if (state == AppLifecycleState.resumed) _syncWithService();
+  }
+
+  @override
   void dispose() {
     // Deliberately does not stop the proxy: the sockets belong to the service
     // isolate and are meant to survive this activity being destroyed.
+    WidgetsBinding.instance.removeObserver(this);
     FlutterForegroundTask.removeTaskDataCallback(_onTaskData);
     _bandwidthRefreshTimer?.cancel();
     _autoStartTimer?.cancel();
