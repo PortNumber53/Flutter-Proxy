@@ -39,6 +39,22 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel)
             .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "bindCellular" -> {
+                        val ok = CellularBinder.start(applicationContext)
+                        result.success(ok)
+                        return@setMethodCallHandler
+                    }
+                    "unbindCellular" -> {
+                        CellularBinder.stop(applicationContext)
+                        result.success(true)
+                        return@setMethodCallHandler
+                    }
+                    "isCellularBound" -> {
+                        result.success(CellularBinder.isBound)
+                        return@setMethodCallHandler
+                    }
+                }
                 if (call.method != "request") {
                     result.notImplemented()
                     return@setMethodCallHandler

@@ -104,6 +104,22 @@ and the `wpad` DNS name.
 mode, which carries the Android Auto accessory protocol and no IP stack. It gets
 no DHCP lease and cannot be given a proxy. Only Wi-Fi clients of the dongle can.
 
+**Correction: the app now binds to cellular explicitly.** The paragraph below
+described what used to happen by accident, and it stopped being true. Android
+decided the dongle AP was `VALIDATED` and made it the default network; because
+the dongle advertises no gateway (`dhcp-option=3`) every outbound socket then
+failed with "Network is unreachable", and the phone itself lost internet while
+associated. The app therefore calls `requestNetwork(TRANSPORT_CELLULAR)` +
+`bindProcessToNetwork()` once its listeners exist, so upstream no longer depends
+on which network Android happens to prefer. Ingress is unaffected -- verified: a
+Wi-Fi client still reaches the proxy while the process is bound to mobile data.
+
+Note this binds only *this app's* process. While the phone is on the dongle AP
+and Android treats it as default, the phone's other apps still have no route
+out; that is Android's choice and nothing the proxy can change.
+
+The original, now-superseded note follows.
+
 **The Flutter app egresses over cellular by itself — no platform channel needed.**
 An earlier draft of this file claimed the opposite. Verified on device instead:
 with the phone associated to `AAWirelessDongle` and the app's HTTP proxy running,
@@ -144,6 +160,8 @@ Raspberry Pi Zero 2 W, phone SM-S908U / Android 16, second client a Pi 3B.
 | PAC MIME type | `application/x-ns-proxy-autoconfig` |
 | Local-subnet exception | `No upstream proxy for 10.0.0.1` → direct |
 | Full chain HTTP / HTTPS | `200` / `200`, egress = cellular |
+| Cellular binding, ingress preserved | client reaches proxy while process bound |
+| Full chain after binding | `200` / `200`, egress `172.56.x` (mobile) |
 | Second client (Tab S8) via PAC | Chrome renders pages; egress = cellular |
 | Sustained browsing, 2 clients | peak 19 connections, 0 refusals |
 | `shutdownd` GET /ping | `200 {"status":"ok"}` |

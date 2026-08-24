@@ -53,6 +53,7 @@ class _ProxyHomePageState extends State<ProxyHomePage>
   bool _running = false;
   bool _shutdownPending = false;
   bool _autoStart = true;
+  bool _cellularBound = false;
   Timer? _autoStartTimer;
   List<DeviceSnapshot> _devices = const [];
   bool _shuttingDownDongle = false;
@@ -155,6 +156,12 @@ class _ProxyHomePageState extends State<ProxyHomePage>
     final live = await FlutterForegroundTask.isRunningService;
     if (mounted && live != _running) setState(() => _running = live);
     if (live) {
+      if (!await DongleControl.isCellularBound()) {
+        final b = await DongleControl.bindCellular();
+        if (mounted) setState(() => _cellularBound = b);
+      } else if (mounted) {
+        setState(() => _cellularBound = true);
+      }
       FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
       _bandwidthRefreshTimer?.cancel();
       _bandwidthRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
@@ -214,6 +221,7 @@ class _ProxyHomePageState extends State<ProxyHomePage>
   Future<void> _toggle() async {
     if (_running) {
       await FlutterForegroundTask.stopService();
+      await DongleControl.unbindCellular();
       WakelockPlus.disable();
       _bandwidthRefreshTimer?.cancel();
       _bandwidthRefreshTimer = null;
@@ -234,6 +242,13 @@ class _ProxyHomePageState extends State<ProxyHomePage>
             'HTTP :${_portController.text} | SOCKS :${_socksPortController.text} | DNS :${_dnsPortController.text}',
         callback: startProxyServiceCallback,
       );
+      // Only after the service is up, so the listening sockets already exist.
+      // Binding pins outbound traffic to mobile data, which is the whole point
+      // of the relay and no longer something Android's default-network choice
+      // can be trusted to provide.
+      final boundNow = await DongleControl.bindCellular();
+      if (mounted) setState(() => _cellularBound = boundNow);
+
       WakelockPlus.enable();
       _bandwidthRefreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
         FlutterForegroundTask.sendDataToTask(proxyStatusRequest);
@@ -593,6 +608,34 @@ class _ProxyHomePageState extends State<ProxyHomePage>
                   ),
                 ),
               ),
+              if (_running && !_cellularBound) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.orange.shade900),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.signal_cellular_off,
+                          size: 18, color: Colors.orange.shade300),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Not pinned to mobile data. Upstream will follow '
+                          'whichever network Android prefers, which may have no '
+                          'route out.',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.orange.shade200),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
               if (!_onDongleNetwork) ...[
                 Container(
                   width: double.infinity,

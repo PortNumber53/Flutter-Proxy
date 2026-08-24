@@ -68,6 +68,36 @@ class DongleControl {
     }
   }
 
+  /// Pin this process's outbound sockets to mobile data.
+  ///
+  /// Called once the proxy's listeners exist, never before: binding affects
+  /// sockets created afterwards, and the listeners must stay reachable from the
+  /// dongle's Wi-Fi.
+  static Future<bool> bindCellular() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('bindCellular') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> unbindCellular() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod('unbindCellular');
+    } catch (_) {}
+  }
+
+  static Future<bool> isCellularBound() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('isCellularBound') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// True if the dongle is reachable and running `shutdownd`.
   Future<bool> ping() async {
     try {
